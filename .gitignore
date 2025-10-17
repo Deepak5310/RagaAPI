@@ -24,6 +24,7 @@ wheels/
 *.egg
 
 # Environment
+.github/*.md
 .env
 .venv
 
