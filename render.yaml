@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: ragalahari-gallery-api
+    runtime: python
+    region: singapore
+    plan: free
+    branch: main
+    buildCommand: "pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt"
+    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: PIP_DEFAULT_TIMEOUT
+        value: 100
