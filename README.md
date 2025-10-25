@@ -23,7 +23,7 @@ RagaAPI/
 │   ├── models.py        # Pydantic data models
 │   └── scraper.py       # Web scraping logic
 ├── requirements.txt     # Python dependencies
-├── render.yaml          # Render.com deployment config
+├── vercel.json          # Vercel deployment config
 └── README.md
 ```
 
@@ -249,15 +249,25 @@ ALLOWED_ORIGINS=["*"]
 
 ## Deployment
 
-### Render.com
+### Vercel
 
-This project is configured for deployment on Render.com (see `render.yaml`).
+This project is configured for deployment on Vercel (see `vercel.json`).
 
 1. Push to GitHub
-2. Connect repository to Render
-3. Deploy automatically using the provided configuration
+2. Install Vercel CLI (if not already):
+  ```bash
+  npm i -g vercel
+  ```
+3. Deploy to Vercel:
+  ```bash
+  vercel --prod
+  ```
+4. API will be available at your Vercel domain.
 
-**Live API**: Deployed at your Render.com URL
+**Note:** Vercel uses `api/index.py` as the entrypoint, which imports your FastAPI app from `main.py`.
+
+**Environment variables:**
+Set any required variables in the Vercel dashboard or via `vercel env`.
 
 ## Technical Details
 
