@@ -1,6 +1,8 @@
 """FastAPI backend for Actress Gallery application"""
 
+import logging
 from typing import List
+
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,11 +11,22 @@ from app.models import Actress, ActressDetail
 from app.scraper import ActressScraper
 from app.config import settings
 
+logging.basicConfig(
+    level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+
 app = FastAPI(title="Actress Gallery API", version="2.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
 
 scraper = ActressScraper()
+
+
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    """Ensure HTTP resources are released when the app stops."""
+    await scraper.close()
 
 
 @app.get("/")

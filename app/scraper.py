@@ -1,6 +1,8 @@
 """Web scraper for fetching actress information from Ragalahari.com"""
 
+import logging
 import re
+import time
 from typing import List, Optional, Dict, Set
 from datetime import datetime
 from asyncio import gather
@@ -21,17 +23,25 @@ SKIP_DOMAINS = frozenset(['images.taboola.com', 'cdn.taboola.com'])
 
 class ActressScraper:
     """Async web scraper for Ragalahari.com actress data"""
+
     def __init__(self):
         """Initialize scraper with session and cache"""
         self.session: Optional[aiohttp.ClientSession] = None
         self.cache: Dict[str, any] = {}
+        self._cache_expiry: Dict[str, float] = {}
+        self.logger = logging.getLogger(self.__class__.__name__)
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create aiohttp session"""
         if self.session is None or self.session.closed:
+            connector = aiohttp.TCPConnector(
+                limit=settings.HTTP_CONNECT_LIMIT,
+                limit_per_host=settings.HTTP_CONNECT_LIMIT_PER_HOST,
+            )
             self.session = aiohttp.ClientSession(
                 headers={"User-Agent": settings.USER_AGENT},
-                timeout=aiohttp.ClientTimeout(total=settings.REQUEST_TIMEOUT)
+                timeout=aiohttp.ClientTimeout(total=settings.REQUEST_TIMEOUT),
+                connector=connector,
             )
         return self.session
 
@@ -39,6 +49,7 @@ class ActressScraper:
         """Close aiohttp session"""
         if self.session and not self.session.closed:
             await self.session.close()
+        self.session = None
 
     @staticmethod
     def _make_absolute_url(url: str) -> str:
@@ -152,6 +163,11 @@ class ActressScraper:
 
     async def scrape_ragalahari_latest(self) -> List[Actress]:
         """Scrape latest 20 galleries from Ragalahari homepage"""
+        cached = self._get_cached_list("latest")
+        if cached is not None:
+            self.logger.debug("Returning cached latest galleries")
+            return list(cached)
+
         url = "https://www.ragalahari.com/actress/starzone.aspx"
         session = await self._get_session()
         actresses = []
@@ -173,17 +189,23 @@ class ActressScraper:
                         if actress:
                             actresses.append(actress)
 
-                print(f"Scraped {len(actresses)} latest galleries")
+                self.logger.info("Scraped %s latest galleries", len(actresses))
+                self._set_cached_list("latest", actresses)
                 return actresses
 
         except (aiohttp.ClientError, TimeoutError) as e:
-            print(f"Error scraping Ragalahari latest: {e}")
+            self.logger.warning("Error scraping Ragalahari latest: %s", e)
             return actresses
 
 
     async def scrape_ragalahari_by_letter(self, letter: str = 'a') -> List[Actress]:
         """Scrape actresses by first letter (A-Z browsing)"""
         letter = letter.lower()
+        cached = self._get_cached_list(f"letter:{letter}")
+        if cached is not None:
+            self.logger.debug("Returning cached actress list for letter '%s'", letter)
+            return list(cached)
+
         url = ("https://www.ragalahari.com/actress/starzonesearch.aspx" if letter == 'a'
                else f"https://www.ragalahari.com/actress/{letter}/starzonesearch.aspx")
 
@@ -212,11 +234,12 @@ class ActressScraper:
                         if actress:
                             actresses.append(actress)
 
-                print(f"Scraped {len(actresses)} actresses from letter '{letter}'")
+                self.logger.info("Scraped %s actresses from letter '%s'", len(actresses), letter)
+                self._set_cached_list(f"letter:{letter}", actresses)
                 return actresses
 
         except (aiohttp.ClientError, TimeoutError) as e:
-            print(f"Error scraping Ragalahari letter '{letter}': {e}")
+            self.logger.warning("Error scraping Ragalahari letter '%s': %s", letter, e)
             return actresses
 
 
@@ -226,7 +249,7 @@ class ActressScraper:
         slug_key = f"{actress_id}_slug"
 
         if url_key not in self.cache:
-            print(f"URL not found in cache for {actress_id}")
+            self.logger.debug("URL not found in cache for %s", actress_id)
             return None
 
         profile_url = self.cache[url_key]
@@ -236,7 +259,9 @@ class ActressScraper:
         try:
             async with session.get(profile_url) as response:
                 if response.status != 200:
-                    print(f"Error fetching {profile_url}: Status {response.status}")
+                    self.logger.warning(
+                        "Error fetching %s: Status %s", profile_url, response.status
+                    )
                     return None
 
                 html = await response.text()
@@ -324,11 +349,16 @@ class ActressScraper:
                     last_updated=datetime.now()
                 )
 
-                print(f"Scraped detail for {name}: {len(images)} images, {len(albums)} albums")
+                self.logger.info(
+                    "Scraped detail for %s: %s images, %s albums",
+                    name,
+                    len(images),
+                    len(albums),
+                )
                 return detail
 
         except (aiohttp.ClientError, TimeoutError) as e:
-            print(f"Error scraping actress detail: {e}")
+            self.logger.warning("Error scraping actress detail: %s", e)
             return None
 
     def _extract_info(self, text: str, label: str) -> Optional[str]:
@@ -429,14 +459,16 @@ class ActressScraper:
         try:
             async with session.get(page_url) as response:
                 if response.status != 200:
-                    print(f"Error fetching album page {page_url}: Status {response.status}")
+                    self.logger.warning(
+                        "Error fetching album page %s: Status %s", page_url, response.status
+                    )
                     return []
 
                 html = await response.text()
                 return self._filter_images(html)
 
         except (aiohttp.ClientError, TimeoutError) as e:
-            print(f"Error scraping album page {page_url}: {e}")
+            self.logger.warning("Error scraping album page %s: %s", page_url, e)
             return []
 
     async def get_ragalahari_album_photos(self, album_url: str) -> List[str]:
@@ -446,7 +478,9 @@ class ActressScraper:
         try:
             async with session.get(album_url) as response:
                 if response.status != 200:
-                    print(f"Error fetching album {album_url}: Status {response.status}")
+                    self.logger.warning(
+                        "Error fetching album %s: Status %s", album_url, response.status
+                    )
                     return []
 
                 html = await response.text()
@@ -459,10 +493,14 @@ class ActressScraper:
                         key=lambda url: int(m.group(1))
                         if (m := IMAGE_NUMBER_PATTERN.search(url)) else 0
                     )
-                    print(f"Scraped {len(photos)} photos from album: {album_url}")
+                    self.logger.info(
+                        "Scraped %s photos from album: %s", len(photos), album_url
+                    )
                     return photos
 
-                print(f"Found {len(pagination_urls)} pages for album: {album_url}")
+                self.logger.debug(
+                    "Found %s pages for album: %s", len(pagination_urls), album_url
+                )
 
             page_photos_list = await gather(
                 *[self._scrape_album_page(url, session) for url in pagination_urls]
@@ -480,10 +518,35 @@ class ActressScraper:
                 key=lambda url: int(m.group(1))
                 if (m := IMAGE_NUMBER_PATTERN.search(url)) else 0
             )
-            print(f"Scraped {len(all_photos)} photos across "
-                  f"{len(pagination_urls)} pages: {album_url}")
+            self.logger.info(
+                "Scraped %s photos across %s pages: %s",
+                len(all_photos),
+                len(pagination_urls),
+                album_url,
+            )
             return all_photos
 
         except (aiohttp.ClientError, TimeoutError) as e:
-            print(f"Error scraping album photos: {e}")
+            self.logger.warning("Error scraping album photos: %s", e)
             return []
+
+    def _set_cached_list(self, cache_key: str, actresses: List[Actress]) -> None:
+        """Cache list responses for reuse with an expiry window."""
+        list_key = f"list:{cache_key}"
+        if settings.CACHE_TTL_SECONDS <= 0:
+            return
+        self.cache[list_key] = list(actresses)
+        self._cache_expiry[list_key] = time.time() + settings.CACHE_TTL_SECONDS
+
+    def _get_cached_list(self, cache_key: str) -> Optional[List[Actress]]:
+        """Return cached list data if still valid."""
+        list_key = f"list:{cache_key}"
+        expiry = self._cache_expiry.get(list_key)
+        if not expiry or expiry <= time.time():
+            self.cache.pop(list_key, None)
+            self._cache_expiry.pop(list_key, None)
+            return None
+        cached = self.cache.get(list_key)
+        if isinstance(cached, list):
+            return cached
+        return None

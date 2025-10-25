@@ -23,7 +23,7 @@ RagaAPI/
 │   ├── models.py        # Pydantic data models
 │   └── scraper.py       # Web scraping logic
 ├── requirements.txt     # Python dependencies
-├── render.yaml          # Render.com deployment config
+├── vercel.json          # Vercel deployment config
 └── README.md
 ```
 
@@ -236,28 +236,43 @@ DEBUG=true
 
 # Scraper Settings
 REQUEST_TIMEOUT=30
-MAX_RETRIES=3
 USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+HTTP_CONNECT_LIMIT=20
+HTTP_CONNECT_LIMIT_PER_HOST=10
 
-# Cache Settings
-CACHE_ENABLED=true
-CACHE_TTL=3600
-
-# CORS Settings
-ALLOWED_ORIGINS=["*"]
+# Cache & Logging
+CACHE_TTL_SECONDS=300
+LOG_LEVEL=INFO
 ```
 
 ## Deployment
 
-### Render.com
+### Vercel
 
-This project is configured for deployment on Render.com (see `render.yaml`).
+This project is configured for deployment on Vercel (see `vercel.json`).
+
+#### Deploy with Vercel CLI
+
+```bash
+# Install Vercel CLI
+npm i -g vercel
+
+# Deploy
+vercel
+```
+
+#### Deploy via GitHub Integration
 
 1. Push to GitHub
-2. Connect repository to Render
-3. Deploy automatically using the provided configuration
+2. Import project to Vercel at [vercel.com/new](https://vercel.com/new)
+3. Vercel will auto-detect the Python project and deploy
 
-**Live API**: Deployed at your Render.com URL
+**Configuration:**
+- Build Command: `pip install -r requirements.txt`
+- Output Directory: (leave empty)
+- Install Command: (leave empty, Vercel auto-detects)
+
+**Live API**: Deployed at `https://your-project.vercel.app`
 
 ## Technical Details
 
