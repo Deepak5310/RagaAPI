@@ -7,10 +7,12 @@ from pydantic import BaseModel, Field
 
 
 class ScraperSource(str, Enum):
+    """Supported scraper sources"""
     RAGALAHARI = "ragalahari"
 
 
 class Actress(BaseModel):
+    """Basic actress information for list views"""
     id: str
     name: str
     thumbnail: str
@@ -21,12 +23,14 @@ class Actress(BaseModel):
 
 
 class Album(BaseModel):
+    """Album/gallery information"""
     name: str
     url: str
     thumbnail: Optional[str] = None
 
 
 class ActressDetail(BaseModel):
+    """Complete actress profile with images and albums"""
     id: str
     name: str
     images: List[str] = Field(default_factory=list)

@@ -1,9 +1,9 @@
 """Web scraper for fetching actress information from Ragalahari.com"""
 
 import re
-import traceback
 from typing import List, Optional, Dict, Set
 from datetime import datetime
+from asyncio import gather
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -11,15 +11,23 @@ from bs4 import BeautifulSoup
 from .models import Actress, ActressDetail, ScraperSource, Album
 from .config import settings
 
+STARZONE_IMAGE_PATTERN = re.compile(
+    r'https://starzone\.ragalahari\.com/[^\s"\'<>]+\.jpg', re.IGNORECASE
+)
+IMAGE_NUMBER_PATTERN = re.compile(r'(\d+)\.jpg$')
+SKIP_KEYWORDS = frozenset(['logo', 'banner', 'icon'])
+SKIP_DOMAINS = frozenset(['images.taboola.com', 'cdn.taboola.com'])
+
 
 class ActressScraper:
-    """Main scraper class for fetching actress data from Ragalahari.com"""
-
+    """Async web scraper for Ragalahari.com actress data"""
     def __init__(self):
+        """Initialize scraper with session and cache"""
         self.session: Optional[aiohttp.ClientSession] = None
         self.cache: Dict[str, any] = {}
 
     async def _get_session(self) -> aiohttp.ClientSession:
+        """Get or create aiohttp session"""
         if self.session is None or self.session.closed:
             self.session = aiohttp.ClientSession(
                 headers={"User-Agent": settings.USER_AGENT},
@@ -28,11 +36,13 @@ class ActressScraper:
         return self.session
 
     async def close(self):
+        """Close aiohttp session"""
         if self.session and not self.session.closed:
             await self.session.close()
 
     @staticmethod
     def _make_absolute_url(url: str) -> str:
+        """Convert relative URL to absolute"""
         if url.startswith('//'):
             return f"https:{url}"
         if url.startswith('/'):
@@ -43,6 +53,7 @@ class ActressScraper:
 
     @staticmethod
     def _extract_actress_name(gallery_title: str) -> str:
+        """Extract clean actress name from gallery title"""
         name_parts = gallery_title.split(' at ')[0].split(' in ')[0].split(',')[0]
         return (name_parts.replace('Actress ', '')
                 .replace('Heroine ', '')
@@ -50,61 +61,48 @@ class ActressScraper:
                 .strip())
 
     def _extract_thumbnail(self, img_tag) -> Optional[str]:
+        """Extract thumbnail URL from img tag"""
         if not img_tag:
             return None
 
-        img_src = (
-            img_tag.get('data-srcset') or
-            img_tag.get('srcset') or
-            img_tag.get('data-src') or
-            img_tag.get('src')
-        )
+        img_src = (img_tag.get('data-srcset') or img_tag.get('srcset') or
+                   img_tag.get('data-src') or img_tag.get('src'))
 
-        if not img_src or img_src == '/img/galthumb.jpg':
-            return None
-
-        return self._make_absolute_url(img_src)
+        if img_src and img_src != '/img/galthumb.jpg':
+            return self._make_absolute_url(img_src)
+        return None
 
     def _build_image_map(self, soup: BeautifulSoup) -> Dict[str, str]:
+        """Build href to thumbnail URL mapping"""
         image_map = {}
-        img_links = soup.find_all('a', class_='galimg')
-
-        for img_link in img_links:
+        for img_link in soup.find_all('a', class_='galimg'):
             href = img_link.get('href')
-            is_valid_href = (
-                href and
-                ('/actress/' in href or '/stars/profile/' in href) and
-                href not in image_map
-            )
-            if is_valid_href:
+            is_valid = (href and
+                       ('/actress/' in href or '/stars/profile/' in href) and
+                       href not in image_map)
+            if is_valid:
                 thumbnail = self._extract_thumbnail(img_link.find('img'))
                 if thumbnail:
                     image_map[href] = thumbnail
-
         return image_map
 
     def _extract_images_from_soup(self, soup: BeautifulSoup, actress_id: str) -> List[str]:
+        """Extract HD images from HTML soup"""
         images = []
-        seen_images: Set[str] = set()
+        seen: Set[str] = set()
 
         for img_tag in soup.find_all('img'):
             img_src = self._extract_thumbnail(img_tag)
-
-            if not img_src:
-                continue
-
-            if img_src.endswith('t.jpg') and not img_src.endswith('thumb.jpg'):
+            if img_src and img_src.endswith('t.jpg') and not img_src.endswith('thumb.jpg'):
                 hd_src = img_src[:-5] + '.jpg'
-                if hd_src not in seen_images:
+                if hd_src not in seen:
                     images.append(hd_src)
-                    seen_images.add(hd_src)
+                    seen.add(hd_src)
 
-        if not images:
-            images = [f"https://picsum.photos/seed/{actress_id}/800/1200"]
-
-        return images
+        return images if images else [f"https://picsum.photos/seed/{actress_id}/800/1200"]
 
     def _create_actress(self, actress_id: str, name: str, thumbnail: str) -> Actress:
+        """Create Actress model instance"""
         return Actress(
             id=actress_id,
             name=name,
@@ -115,7 +113,45 @@ class ActressScraper:
             source=ScraperSource.RAGALAHARI
         )
 
+    def _process_actress_link(self, link, href: str, image_map: Dict[str, str],
+                              is_latest: bool = False) -> Optional[Actress]:
+        """Process a single actress link and return Actress object"""
+        parts = href.split('/')
+
+        if '/actress/' in href and len(parts) >= 4:
+            gallery_id = parts[2]
+            gallery_slug = parts[3].replace('.aspx', '') if len(parts) > 3 else ''
+            text = link.get_text(strip=True)
+            name = self._extract_actress_name(text) if is_latest else text
+
+            cache_key = f"rh_{gallery_id}"
+            self.cache[f"{cache_key}_url"] = self._make_absolute_url(href)
+            self.cache[f"{cache_key}_slug"] = gallery_slug
+            if is_latest:
+                self.cache[f"{cache_key}_title"] = text
+                self.cache[f"{cache_key}_is_latest"] = True
+
+            thumbnail = (image_map.get(href) or
+                        f"https://www.ragalahari.com{href.replace('.aspx', '')}-thumbnail.jpg")
+            return self._create_actress(cache_key, name, thumbnail)
+
+        elif '/stars/profile/' in href and len(parts) >= 5:
+            actress_id = parts[3]
+            actress_slug = parts[4].replace('.aspx', '')
+            name = link.get_text(strip=True)
+
+            cache_key = f"rh_{actress_id}"
+            self.cache[f"{cache_key}_url"] = self._make_absolute_url(href)
+            self.cache[f"{cache_key}_slug"] = actress_slug
+
+            thumbnail = (image_map.get(href) or
+                        f"https://www.ragalahari.com{href.replace('.aspx', '')}-thumbnail.jpg")
+            return self._create_actress(cache_key, name, thumbnail)
+
+        return None
+
     async def scrape_ragalahari_latest(self) -> List[Actress]:
+        """Scrape latest 20 galleries from Ragalahari homepage"""
         url = "https://www.ragalahari.com/actress/starzone.aspx"
         session = await self._get_session()
         actresses = []
@@ -129,50 +165,27 @@ class ActressScraper:
                 html = await response.text()
                 soup = BeautifulSoup(html, 'html.parser')
                 image_map = self._build_image_map(soup)
-                name_links = soup.find_all('a', class_='galleryname')
 
-                for link in name_links:
+                for link in soup.find_all('a', class_='galleryname'):
                     href = link.get('href')
-                    gallery_title = link.get_text(strip=True)
-
-                    if not gallery_title or not href or '/actress/' not in href:
-                        continue
-
-                    name = self._extract_actress_name(gallery_title)
-                    parts = href.split('/')
-
-                    if len(parts) >= 4:
-                        gallery_id = parts[2]
-                        gallery_slug = parts[3].replace('.aspx', '') if len(parts) > 3 else ''
-                        gallery_url = self._make_absolute_url(href)
-
-                        cache_key = f"rh_{gallery_id}"
-                        self.cache[f"{cache_key}_url"] = gallery_url
-                        self.cache[f"{cache_key}_slug"] = gallery_slug
-                        self.cache[f"{cache_key}_title"] = gallery_title
-                        self.cache[f"{cache_key}_is_latest"] = True
-
-                        thumbnail = image_map.get(href) or (
-                            f"https://www.ragalahari.com"
-                            f"{href.replace('.aspx', '')}-thumbnail.jpg"
-                        )
-
-                        actress = self._create_actress(cache_key, name, thumbnail)
-                        actresses.append(actress)
+                    if href and '/actress/' in href:
+                        actress = self._process_actress_link(link, href, image_map, is_latest=True)
+                        if actress:
+                            actresses.append(actress)
 
                 print(f"Scraped {len(actresses)} latest galleries")
                 return actresses
 
-        except (aiohttp.ClientError, ValueError, KeyError) as e:
-            print(f"Error scraping Ragalahari latest: {str(e)}")
-            traceback.print_exc()
+        except (aiohttp.ClientError, TimeoutError) as e:
+            print(f"Error scraping Ragalahari latest: {e}")
             return actresses
 
 
     async def scrape_ragalahari_by_letter(self, letter: str = 'a') -> List[Actress]:
+        """Scrape actresses by first letter (A-Z browsing)"""
         letter = letter.lower()
-        url = "https://www.ragalahari.com/actress/starzonesearch.aspx" if letter == 'a' \
-              else f"https://www.ragalahari.com/actress/{letter}/starzonesearch.aspx"
+        url = ("https://www.ragalahari.com/actress/starzonesearch.aspx" if letter == 'a'
+               else f"https://www.ragalahari.com/actress/{letter}/starzonesearch.aspx")
 
         session = await self._get_session()
         actresses = []
@@ -191,62 +204,24 @@ class ActressScraper:
                     soup = galleries_section
 
                 image_map = self._build_image_map(soup)
-                name_links = soup.find_all('a', class_='galleryname')
 
-                for link in name_links:
+                for link in soup.find_all('a', class_='galleryname'):
                     href = link.get('href')
-                    name = link.get_text(strip=True)
-
-                    if not name or not href:
-                        continue
-
-                    parts = href.split('/')
-
-                    if '/actress/' in href and len(parts) >= 4:
-                        gallery_id = parts[2]
-                        gallery_slug = parts[3].replace('.aspx', '') if len(parts) > 3 else ''
-                        actress_name = self._extract_actress_name(name)
-
-                        gallery_url = self._make_absolute_url(href)
-                        cache_key = f"rh_{gallery_id}"
-                        self.cache[f"{cache_key}_url"] = gallery_url
-                        self.cache[f"{cache_key}_slug"] = gallery_slug
-
-                        thumbnail = image_map.get(href) or (
-                            f"https://www.ragalahari.com"
-                            f"{href.replace('.aspx', '')}-thumbnail.jpg"
-                        )
-
-                        actress = self._create_actress(cache_key, actress_name, thumbnail)
-                        actresses.append(actress)
-
-                    elif '/stars/profile/' in href and len(parts) >= 5:
-                        actress_id = parts[3]
-                        actress_slug = parts[4].replace('.aspx', '')
-
-                        profile_url = self._make_absolute_url(href)
-                        cache_key = f"rh_{actress_id}"
-                        self.cache[f"{cache_key}_url"] = profile_url
-                        self.cache[f"{cache_key}_slug"] = actress_slug
-
-                        thumbnail = image_map.get(href) or (
-                            f"https://www.ragalahari.com"
-                            f"{href.replace('.aspx', '')}-thumbnail.jpg"
-                        )
-
-                        actress = self._create_actress(cache_key, name, thumbnail)
-                        actresses.append(actress)
+                    if href:
+                        actress = self._process_actress_link(link, href, image_map)
+                        if actress:
+                            actresses.append(actress)
 
                 print(f"Scraped {len(actresses)} actresses from letter '{letter}'")
                 return actresses
 
-        except (aiohttp.ClientError, ValueError, KeyError) as e:
-            print(f"Error scraping Ragalahari letter '{letter}': {str(e)}")
-            traceback.print_exc()
+        except (aiohttp.ClientError, TimeoutError) as e:
+            print(f"Error scraping Ragalahari letter '{letter}': {e}")
             return actresses
 
 
     async def get_ragalahari_actress_detail(self, actress_id: str) -> Optional[ActressDetail]:
+        """Get complete actress profile with images and albums"""
         url_key = f"{actress_id}_url"
         slug_key = f"{actress_id}_slug"
 
@@ -305,7 +280,8 @@ class ActressScraper:
                     if not album_name or len(album_name) < 3:
                         url_parts = album_href.split('/')
                         if len(url_parts) >= 3:
-                            album_name = url_parts[-1].replace('.aspx', '').replace('-', ' ').title()
+                            slug = url_parts[-1].replace('.aspx', '').replace('-', ' ')
+                            album_name = slug.title()
 
                     if album_name and len(album_name) > 3:
                         album_url = self._make_absolute_url(album_href)
@@ -351,12 +327,12 @@ class ActressScraper:
                 print(f"Scraped detail for {name}: {len(images)} images, {len(albums)} albums")
                 return detail
 
-        except (aiohttp.ClientError, ValueError, KeyError) as e:
-            print(f"Error scraping actress detail: {str(e)}")
-            traceback.print_exc()
+        except (aiohttp.ClientError, TimeoutError) as e:
+            print(f"Error scraping actress detail: {e}")
             return None
 
     def _extract_info(self, text: str, label: str) -> Optional[str]:
+        """Extract labeled information from text"""
         if label in text:
             start = text.find(label)
             end = text.find('\n', start)
@@ -365,6 +341,7 @@ class ActressScraper:
         return None
 
     def _extract_birth_date(self, text: str) -> Optional[str]:
+        """Extract birth date from bio text"""
         if 'Born:' in text:
             born_start = text.find('Born:')
             born_end = text.find('\n', born_start)
@@ -377,11 +354,13 @@ class ActressScraper:
 
     def _is_actress_album(self, album_name: str, album_href: str,
                           actress_name: str, actress_slug: str) -> bool:
+        """Check if album belongs to the actress"""
         album_name_lower = album_name.lower()
         album_url_lower = album_href.lower()
 
         first_name = actress_name.split()[0].lower() if actress_name else ""
-        last_name = actress_name.split()[-1].lower() if actress_name and len(actress_name.split()) > 1 else ""
+        name_parts = actress_name.split() if actress_name else []
+        last_name = name_parts[-1].lower() if len(name_parts) > 1 else ""
 
         slug_in_url = actress_slug.lower() in album_url_lower if actress_slug else False
 
@@ -400,6 +379,7 @@ class ActressScraper:
 
 
     async def get_ragalahari_actress_albums(self, actress_id: str) -> List[dict]:
+        """Get all albums for an actress"""
         cache_key = f"{actress_id}_albums"
         if cache_key in self.cache:
             return self.cache[cache_key]
@@ -410,7 +390,57 @@ class ActressScraper:
 
         return []
 
+    async def _extract_pagination_urls(self, soup: BeautifulSoup, base_url: str) -> List[str]:
+        """Extract all pagination URLs from album page"""
+        seen = {base_url}
+        pagination_urls = [base_url]
+
+        for link in soup.find_all('a', class_='otherPage'):
+            href = link.get('href')
+            if href:
+                page_url = self._make_absolute_url(href)
+                if page_url not in seen:
+                    pagination_urls.append(page_url)
+                    seen.add(page_url)
+
+        return pagination_urls
+
+    def _filter_images(self, html: str) -> List[str]:
+        """Extract and filter images from HTML"""
+        photos = []
+        seen = set()
+
+        for img_url in STARZONE_IMAGE_PATTERN.findall(html):
+            if img_url.endswith('t.jpg'):
+                img_url = img_url[:-5] + '.jpg'
+            elif img_url.endswith('thumb.jpg'):
+                continue
+
+            if (img_url not in seen and
+                not any(domain in img_url for domain in SKIP_DOMAINS) and
+                not any(skip in img_url.lower() for skip in SKIP_KEYWORDS)):
+                seen.add(img_url)
+                photos.append(img_url)
+
+        return photos
+
+    async def _scrape_album_page(self, page_url: str, session: aiohttp.ClientSession) -> List[str]:
+        """Scrape images from a single album page"""
+        try:
+            async with session.get(page_url) as response:
+                if response.status != 200:
+                    print(f"Error fetching album page {page_url}: Status {response.status}")
+                    return []
+
+                html = await response.text()
+                return self._filter_images(html)
+
+        except (aiohttp.ClientError, TimeoutError) as e:
+            print(f"Error scraping album page {page_url}: {e}")
+            return []
+
     async def get_ragalahari_album_photos(self, album_url: str) -> List[str]:
+        """Get all high-quality photos from an album with pagination support"""
         session = await self._get_session()
 
         try:
@@ -420,36 +450,40 @@ class ActressScraper:
                     return []
 
                 html = await response.text()
-                pattern = r'https://starzone\.ragalahari\.com/[^\s"\'<>]+\.jpg'
-                matches = re.findall(pattern, html, re.IGNORECASE)
+                soup = BeautifulSoup(html, 'html.parser')
+                pagination_urls = await self._extract_pagination_urls(soup, album_url)
 
-                photos = []
-                seen = set()
+                if len(pagination_urls) == 1:
+                    photos = self._filter_images(html)
+                    photos.sort(
+                        key=lambda url: int(m.group(1))
+                        if (m := IMAGE_NUMBER_PATTERN.search(url)) else 0
+                    )
+                    print(f"Scraped {len(photos)} photos from album: {album_url}")
+                    return photos
 
-                for img_url in matches:
-                    if img_url.endswith('t.jpg'):
-                        img_url = img_url[:-5] + '.jpg'
-                    elif img_url.endswith('thumb.jpg'):
-                        continue
+                print(f"Found {len(pagination_urls)} pages for album: {album_url}")
 
-                    if img_url in seen:
-                        continue
+            page_photos_list = await gather(
+                *[self._scrape_album_page(url, session) for url in pagination_urls]
+            )
 
-                    if 'images.taboola.com' in img_url or 'cdn.taboola.com' in img_url:
-                        continue
+            all_photos = []
+            seen = set()
+            for page_photos in page_photos_list:
+                for photo in page_photos:
+                    if photo not in seen:
+                        all_photos.append(photo)
+                        seen.add(photo)
 
-                    if any(skip in img_url.lower() for skip in ['logo', 'banner', 'icon']):
-                        continue
+            all_photos.sort(
+                key=lambda url: int(m.group(1))
+                if (m := IMAGE_NUMBER_PATTERN.search(url)) else 0
+            )
+            print(f"Scraped {len(all_photos)} photos across "
+                  f"{len(pagination_urls)} pages: {album_url}")
+            return all_photos
 
-                    seen.add(img_url)
-                    photos.append(img_url)
-
-                photos.sort(key=lambda url: int(m.group(1)) if (m := re.search(r'(\d+)\.jpg$', url)) else 0)
-
-                print(f"Scraped {len(photos)} high-quality photos from album: {album_url}")
-                return photos
-
-        except (aiohttp.ClientError, ValueError, KeyError) as e:
-            print(f"Error scraping album photos: {str(e)}")
-            traceback.print_exc()
+        except (aiohttp.ClientError, TimeoutError) as e:
+            print(f"Error scraping album photos: {e}")
             return []

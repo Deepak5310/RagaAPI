@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: ragalahari-gallery-api
+    name: actress-gallery-api
     runtime: python
     region: singapore
     plan: free
