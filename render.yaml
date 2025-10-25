@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: actress-gallery-api
+    name: raga-api
     runtime: python
     region: singapore
     plan: free

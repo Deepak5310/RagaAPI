@@ -1,4 +1,4 @@
-# RagaAPI - Actress Gallery API
+# RagaAPI - Gallery API
 
 A FastAPI-based web scraping service for fetching actress gallery information from Ragalahari.com.
 
