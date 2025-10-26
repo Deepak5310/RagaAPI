@@ -1,8 +1,9 @@
 """Web scraper for fetching actress information from Ragalahari.com"""
 
 import re
-from typing import List, Optional, Dict, Set
-from datetime import datetime
+import asyncio
+from typing import List, Optional, Dict, Set, Any, Tuple
+from datetime import datetime, timedelta
 from asyncio import gather
 
 import aiohttp
@@ -18,20 +19,66 @@ IMAGE_NUMBER_PATTERN = re.compile(r'(\d+)\.jpg$')
 SKIP_KEYWORDS = frozenset(['logo', 'banner', 'icon'])
 SKIP_DOMAINS = frozenset(['images.taboola.com', 'cdn.taboola.com'])
 
+# Cache TTL: 1 hour for list endpoints, 6 hours for detail
+CACHE_TTL_LIST = timedelta(hours=1)
+CACHE_TTL_DETAIL = timedelta(hours=6)
+
+# Retry configuration
+MAX_RETRIES = 3
+RETRY_DELAY = 1  # seconds
+
 
 class ActressScraper:
     """Async web scraper for Ragalahari.com actress data"""
     def __init__(self):
         """Initialize scraper with session and cache"""
         self.session: Optional[aiohttp.ClientSession] = None
-        self.cache: Dict[str, any] = {}
+        self.cache: Dict[str, Tuple[Any, datetime]] = {}
+
+    def _get_cache(self, key: str) -> Optional[Any]:
+        """Get cached value if not expired"""
+        if key in self.cache:
+            value, timestamp = self.cache[key]
+            # Check if detail cache (longer TTL)
+            is_detail = key.endswith('_albums') or key.endswith('_detail')
+            ttl = CACHE_TTL_DETAIL if is_detail else CACHE_TTL_LIST
+            if datetime.now() - timestamp < ttl:
+                return value
+            # Expired, remove
+            del self.cache[key]
+
+        # Periodically clean expired cache (every 100 reads)
+        if len(self.cache) > 100:
+            self._clear_expired_cache()
+
+        return None
+
+    def _set_cache(self, key: str, value: Any) -> None:
+        """Set cache with timestamp"""
+        self.cache[key] = (value, datetime.now())
+
+    def _clear_expired_cache(self) -> None:
+        """Clear expired cache entries"""
+        now = datetime.now()
+        expired_keys = [
+            key for key, (_, timestamp) in self.cache.items()
+            if now - timestamp > CACHE_TTL_DETAIL
+        ]
+        for key in expired_keys:
+            del self.cache[key]
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        """Get or create aiohttp session"""
+        """Get or create aiohttp session with connection pooling"""
         if self.session is None or self.session.closed:
+            connector = aiohttp.TCPConnector(
+                limit=100,  # Max 100 concurrent connections
+                limit_per_host=30,  # Max 30 per host
+                ttl_dns_cache=300  # DNS cache for 5 mins
+            )
             self.session = aiohttp.ClientSession(
                 headers={"User-Agent": settings.USER_AGENT},
-                timeout=aiohttp.ClientTimeout(total=settings.REQUEST_TIMEOUT)
+                timeout=aiohttp.ClientTimeout(total=settings.REQUEST_TIMEOUT),
+                connector=connector
             )
         return self.session
 
@@ -39,6 +86,34 @@ class ActressScraper:
         """Close aiohttp session"""
         if self.session and not self.session.closed:
             await self.session.close()
+
+    async def _fetch_with_retry(
+        self, url: str, retries: int = MAX_RETRIES
+    ) -> Optional[str]:
+        """Fetch URL with exponential backoff retry"""
+        session = await self._get_session()
+
+        for attempt in range(retries):
+            try:
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        return await response.text()
+                    elif response.status == 429:  # Rate limited
+                        wait_time = RETRY_DELAY * (2 ** attempt)
+                        msg = f"Rate limited, waiting {wait_time}s..."
+                        print(msg)
+                        await asyncio.sleep(wait_time)
+                    else:
+                        status = response.status
+                        print(f"Error fetching {url}: Status {status}")
+                        if attempt < retries - 1:
+                            await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                print(f"Request failed (attempt {attempt + 1}/{retries}): {e}")
+                if attempt < retries - 1:
+                    await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
+
+        return None
 
     @staticmethod
     def _make_absolute_url(url: str) -> str:
@@ -54,7 +129,9 @@ class ActressScraper:
     @staticmethod
     def _extract_actress_name(gallery_title: str) -> str:
         """Extract clean actress name from gallery title"""
-        name_parts = gallery_title.split(' at ')[0].split(' in ')[0].split(',')[0]
+        title = gallery_title.split(' at ')[0]
+        title = title.split(' in ')[0].split(',')[0]
+        name_parts = title
         return (name_parts.replace('Actress ', '')
                 .replace('Heroine ', '')
                 .replace('Model ', '')
@@ -86,22 +163,29 @@ class ActressScraper:
                     image_map[href] = thumbnail
         return image_map
 
-    def _extract_images_from_soup(self, soup: BeautifulSoup, actress_id: str) -> List[str]:
+    def _extract_images_from_soup(
+        self, soup: BeautifulSoup, actress_id: str
+    ) -> List[str]:
         """Extract HD images from HTML soup"""
         images = []
         seen: Set[str] = set()
 
         for img_tag in soup.find_all('img'):
             img_src = self._extract_thumbnail(img_tag)
-            if img_src and img_src.endswith('t.jpg') and not img_src.endswith('thumb.jpg'):
+            is_thumb = img_src and img_src.endswith('t.jpg')
+            is_not_thumb_file = not img_src.endswith('thumb.jpg')
+            if img_src and is_thumb and is_not_thumb_file:
                 hd_src = img_src[:-5] + '.jpg'
                 if hd_src not in seen:
                     images.append(hd_src)
                     seen.add(hd_src)
 
-        return images if images else [f"https://picsum.photos/seed/{actress_id}/800/1200"]
+        fallback = f"https://picsum.photos/seed/{actress_id}/800/1200"
+        return images if images else [fallback]
 
-    def _create_actress(self, actress_id: str, name: str, thumbnail: str) -> Actress:
+    def _create_actress(
+        self, actress_id: str, name: str, thumbnail: str
+    ) -> Actress:
         """Create Actress model instance"""
         return Actress(
             id=actress_id,
@@ -120,19 +204,22 @@ class ActressScraper:
 
         if '/actress/' in href and len(parts) >= 4:
             gallery_id = parts[2]
-            gallery_slug = parts[3].replace('.aspx', '') if len(parts) > 3 else ''
+            slug = parts[3].replace('.aspx', '') if len(parts) > 3 else ''
+            gallery_slug = slug
             text = link.get_text(strip=True)
             name = self._extract_actress_name(text) if is_latest else text
 
             cache_key = f"rh_{gallery_id}"
-            self.cache[f"{cache_key}_url"] = self._make_absolute_url(href)
-            self.cache[f"{cache_key}_slug"] = gallery_slug
+            absolute_url = self._make_absolute_url(href)
+            self._set_cache(f"{cache_key}_url", absolute_url)
+            self._set_cache(f"{cache_key}_slug", gallery_slug)
             if is_latest:
-                self.cache[f"{cache_key}_title"] = text
-                self.cache[f"{cache_key}_is_latest"] = True
+                self._set_cache(f"{cache_key}_title", text)
+                self._set_cache(f"{cache_key}_is_latest", True)
 
-            thumbnail = (image_map.get(href) or
-                        f"https://www.ragalahari.com{href.replace('.aspx', '')}-thumbnail.jpg")
+            base_url = f"https://www.ragalahari.com{href}"
+            thumbnail_url = base_url.replace('.aspx', '') + '-thumbnail.jpg'
+            thumbnail = image_map.get(href) or thumbnail_url
             return self._create_actress(cache_key, name, thumbnail)
 
         elif '/stars/profile/' in href and len(parts) >= 5:
@@ -141,195 +228,210 @@ class ActressScraper:
             name = link.get_text(strip=True)
 
             cache_key = f"rh_{actress_id}"
-            self.cache[f"{cache_key}_url"] = self._make_absolute_url(href)
-            self.cache[f"{cache_key}_slug"] = actress_slug
+            absolute_url = self._make_absolute_url(href)
+            self._set_cache(f"{cache_key}_url", absolute_url)
+            self._set_cache(f"{cache_key}_slug", actress_slug)
 
-            thumbnail = (image_map.get(href) or
-                        f"https://www.ragalahari.com{href.replace('.aspx', '')}-thumbnail.jpg")
+            base_url = f"https://www.ragalahari.com{href}"
+            thumbnail_url = base_url.replace('.aspx', '') + '-thumbnail.jpg'
+            thumbnail = image_map.get(href) or thumbnail_url
             return self._create_actress(cache_key, name, thumbnail)
 
         return None
 
     async def scrape_ragalahari_latest(self) -> List[Actress]:
         """Scrape latest 20 galleries from Ragalahari homepage"""
+        # Check cache first
+        cached = self._get_cache('latest_galleries')
+        if cached:
+            return cached
+
         url = "https://www.ragalahari.com/actress/starzone.aspx"
-        session = await self._get_session()
         actresses = []
 
-        try:
-            async with session.get(url) as response:
-                if response.status != 200:
-                    print(f"Error fetching {url}: Status {response.status}")
-                    return actresses
-
-                html = await response.text()
-                soup = BeautifulSoup(html, 'html.parser')
-                image_map = self._build_image_map(soup)
-
-                for link in soup.find_all('a', class_='galleryname'):
-                    href = link.get('href')
-                    if href and '/actress/' in href:
-                        actress = self._process_actress_link(link, href, image_map, is_latest=True)
-                        if actress:
-                            actresses.append(actress)
-
-                print(f"Scraped {len(actresses)} latest galleries")
-                return actresses
-
-        except (aiohttp.ClientError, TimeoutError) as e:
-            print(f"Error scraping Ragalahari latest: {e}")
+        html = await self._fetch_with_retry(url)
+        if not html:
             return actresses
 
+        soup = BeautifulSoup(html, 'lxml')
+        image_map = self._build_image_map(soup)
 
-    async def scrape_ragalahari_by_letter(self, letter: str = 'a') -> List[Actress]:
+        for link in soup.find_all('a', class_='galleryname'):
+            href = link.get('href')
+            if href and '/actress/' in href:
+                actress = self._process_actress_link(link, href, image_map, is_latest=True)
+                if actress:
+                    actresses.append(actress)
+
+        msg = f"Scraped {len(actresses)} latest galleries"
+        print(msg)
+        self._set_cache('latest_galleries', actresses)
+        return actresses
+
+
+    async def scrape_ragalahari_by_letter(
+        self, letter: str = 'a'
+    ) -> List[Actress]:
         """Scrape actresses by first letter (A-Z browsing)"""
         letter = letter.lower()
-        url = ("https://www.ragalahari.com/actress/starzonesearch.aspx" if letter == 'a'
-               else f"https://www.ragalahari.com/actress/{letter}/starzonesearch.aspx")
 
-        session = await self._get_session()
+        # Check cache first
+        cache_key = f'letter_{letter}'
+        cached = self._get_cache(cache_key)
+        if cached:
+            return cached
+
+        base = "https://www.ragalahari.com/actress"
+        url = (f"{base}/starzonesearch.aspx" if letter == 'a'
+               else f"{base}/{letter}/starzonesearch.aspx")
+
         actresses = []
 
-        try:
-            async with session.get(url) as response:
-                if response.status != 200:
-                    print(f"Error fetching {url}: Status {response.status}")
-                    return actresses
-
-                html = await response.text()
-                soup = BeautifulSoup(html, 'html.parser')
-
-                galleries_section = soup.find('div', {'id': 'galleries'})
-                if galleries_section:
-                    soup = galleries_section
-
-                image_map = self._build_image_map(soup)
-
-                for link in soup.find_all('a', class_='galleryname'):
-                    href = link.get('href')
-                    if href:
-                        actress = self._process_actress_link(link, href, image_map)
-                        if actress:
-                            actresses.append(actress)
-
-                print(f"Scraped {len(actresses)} actresses from letter '{letter}'")
-                return actresses
-
-        except (aiohttp.ClientError, TimeoutError) as e:
-            print(f"Error scraping Ragalahari letter '{letter}': {e}")
+        html = await self._fetch_with_retry(url)
+        if not html:
             return actresses
 
+        soup = BeautifulSoup(html, 'lxml')
 
-    async def get_ragalahari_actress_detail(self, actress_id: str) -> Optional[ActressDetail]:
+        galleries_section = soup.find('div', {'id': 'galleries'})
+        if galleries_section:
+            soup = galleries_section
+
+        image_map = self._build_image_map(soup)
+
+        for link in soup.find_all('a', class_='galleryname'):
+            href = link.get('href')
+            if href:
+                actress = self._process_actress_link(link, href, image_map)
+                if actress:
+                    actresses.append(actress)
+
+        msg = f"Scraped {len(actresses)} actresses from letter '{letter}'"
+        print(msg)
+        self._set_cache(cache_key, actresses)
+        return actresses
+
+
+    async def get_ragalahari_actress_detail(
+        self, actress_id: str
+    ) -> Optional[ActressDetail]:
         """Get complete actress profile with images and albums"""
         url_key = f"{actress_id}_url"
         slug_key = f"{actress_id}_slug"
 
-        if url_key not in self.cache:
+        # Get from cache (with TTL check)
+        profile_url = self._get_cache(url_key)
+        actress_slug = self._get_cache(slug_key)
+
+        if not profile_url or not actress_slug:
             print(f"URL not found in cache for {actress_id}")
             return None
 
-        profile_url = self.cache[url_key]
-        actress_slug = self.cache[slug_key]
-        session = await self._get_session()
-
-        try:
-            async with session.get(profile_url) as response:
-                if response.status != 200:
-                    print(f"Error fetching {profile_url}: Status {response.status}")
-                    return None
-
-                html = await response.text()
-                soup = BeautifulSoup(html, 'html.parser')
-
-                name_elem = soup.find('h1')
-                name = (
-                    name_elem.get_text(strip=True) if name_elem
-                    else actress_slug.replace('-', ' ').title()
-                )
-
-                bio = ""
-                bio_section = soup.find('div', id='bio') or soup.find('section', class_='biography')
-                if bio_section:
-                    paragraphs = bio_section.find_all('p')
-                    bio = ' '.join([p.get_text(strip=True) for p in paragraphs[:2]])
-
-                info_text = soup.get_text()
-                height = self._extract_info(info_text, 'Height:')
-                birth_date = self._extract_birth_date(info_text)
-
-                gallery_map = self._build_image_map(soup)
-                name_links = soup.find_all('a', class_='galleryname')
-
-                albums = []
-                seen_urls = set()
-
-                for link in name_links:
-                    album_href = link.get('href')
-                    album_name = link.get_text(strip=True)
-
-                    if not album_href or album_href in seen_urls or '/actress/' not in album_href:
-                        continue
-
-                    if 'profile' in album_href.lower() or 'search' in album_href.lower():
-                        continue
-
-                    if not self._is_actress_album(album_name, album_href, name, actress_slug):
-                        continue
-
-                    if not album_name or len(album_name) < 3:
-                        url_parts = album_href.split('/')
-                        if len(url_parts) >= 3:
-                            slug = url_parts[-1].replace('.aspx', '').replace('-', ' ')
-                            album_name = slug.title()
-
-                    if album_name and len(album_name) > 3:
-                        album_url = self._make_absolute_url(album_href)
-                        thumbnail = gallery_map.get(album_href)
-
-                        albums.append({
-                            "name": album_name,
-                            "url": album_url,
-                            "thumbnail": thumbnail
-                        })
-                        seen_urls.add(album_href)
-
-                self.cache[f"{actress_id}_albums"] = albums
-
-                images = []
-                is_from_latest = self.cache.get(f"{actress_id}_is_latest", False)
-
-                if is_from_latest:
-                    images = self._extract_images_from_soup(soup, actress_id)
-
-                album_objects = [
-                    Album(name=album['name'], url=album['url'], thumbnail=album.get('thumbnail'))
-                    for album in albums
-                ]
-
-                detail = ActressDetail(
-                    id=actress_id,
-                    name=name,
-                    images=images,
-                    albums=album_objects,
-                    age=None,
-                    birth_date=birth_date,
-                    nationality="Indian",
-                    profession="Actress",
-                    height=height,
-                    bio=bio[:500] if bio else f"{name} is an Indian actress.",
-                    known_for=[],
-                    social_media={},
-                    source=ScraperSource.RAGALAHARI,
-                    last_updated=datetime.now()
-                )
-
-                print(f"Scraped detail for {name}: {len(images)} images, {len(albums)} albums")
-                return detail
-
-        except (aiohttp.ClientError, TimeoutError) as e:
-            print(f"Error scraping actress detail: {e}")
+        html = await self._fetch_with_retry(profile_url)
+        if not html:
             return None
+
+        soup = BeautifulSoup(html, 'lxml')
+
+        name_elem = soup.find('h1')
+        name = (
+            name_elem.get_text(strip=True) if name_elem
+            else actress_slug.replace('-', ' ').title()
+        )
+
+        bio = ""
+        bio_elem = soup.find('div', id='bio')
+        bio_section = bio_elem or soup.find('section', class_='biography')
+        if bio_section:
+            paragraphs = bio_section.find_all('p')
+            bio = ' '.join([p.get_text(strip=True) for p in paragraphs[:2]])
+
+        info_text = soup.get_text()
+        height = self._extract_info(info_text, 'Height:')
+        birth_date = self._extract_birth_date(info_text)
+
+        gallery_map = self._build_image_map(soup)
+        name_links = soup.find_all('a', class_='galleryname')
+
+        albums = []
+        seen_urls = set()
+
+        for link in name_links:
+            album_href = link.get('href')
+            album_name = link.get_text(strip=True)
+
+            has_no_href = not album_href or album_href in seen_urls
+            is_not_actress = '/actress/' not in album_href
+            if has_no_href or is_not_actress:
+                continue
+
+            is_profile = 'profile' in album_href.lower()
+            is_search = 'search' in album_href.lower()
+            if is_profile or is_search:
+                continue
+
+            belongs = self._is_actress_album(
+                album_name, album_href, name, actress_slug
+            )
+            if not belongs:
+                continue
+
+            if not album_name or len(album_name) < 3:
+                url_parts = album_href.split('/')
+                if len(url_parts) >= 3:
+                    slug = url_parts[-1].replace('.aspx', '').replace('-', ' ')
+                    album_name = slug.title()
+
+            if album_name and len(album_name) > 3:
+                album_url = self._make_absolute_url(album_href)
+                thumbnail = gallery_map.get(album_href)
+
+                albums.append({
+                    "name": album_name,
+                    "url": album_url,
+                    "thumbnail": thumbnail
+                })
+                seen_urls.add(album_href)
+
+        self._set_cache(f"{actress_id}_albums", albums)
+
+        images = []
+        is_from_latest = self._get_cache(f"{actress_id}_is_latest")
+        is_from_latest = is_from_latest or False
+
+        if is_from_latest:
+            images = self._extract_images_from_soup(soup, actress_id)
+
+        album_objects = [
+            Album(
+                name=album['name'],
+                url=album['url'],
+                thumbnail=album.get('thumbnail')
+            )
+            for album in albums
+        ]
+
+        detail = ActressDetail(
+            id=actress_id,
+            name=name,
+            images=images,
+            albums=album_objects,
+            age=None,
+            birth_date=birth_date,
+            nationality="Indian",
+            profession="Actress",
+            height=height,
+            bio=bio[:500] if bio else f"{name} is an Indian actress.",
+            known_for=[],
+            social_media={},
+            source=ScraperSource.RAGALAHARI,
+            last_updated=datetime.now()
+        )
+
+        img_cnt = len(images)
+        alb_cnt = len(albums)
+        print(f"Scraped detail for {name}: {img_cnt} images, {alb_cnt} albums")
+        return detail
 
     def _extract_info(self, text: str, label: str) -> Optional[str]:
         """Extract labeled information from text"""
@@ -346,7 +448,8 @@ class ActressScraper:
             born_start = text.find('Born:')
             born_end = text.find('\n', born_start)
             if born_end > born_start:
-                birth_info = text[born_start:born_end].replace('Born:', '').strip()
+                born_info = text[born_start:born_end]
+                birth_info = born_info.replace('Born:', '').strip()
                 parts = birth_info.split(',')
                 if len(parts) >= 2:
                     return ','.join(parts[:2]).strip()
@@ -360,15 +463,20 @@ class ActressScraper:
 
         first_name = actress_name.split()[0].lower() if actress_name else ""
         name_parts = actress_name.split() if actress_name else []
-        last_name = name_parts[-1].lower() if len(name_parts) > 1 else ""
+        last_name_idx = -1
+        last_name = name_parts[last_name_idx].lower() if len(name_parts) > 1 else ""
 
-        slug_in_url = actress_slug.lower() in album_url_lower if actress_slug else False
+        slug_in_url = False
+        if actress_slug:
+            slug_in_url = actress_slug.lower() in album_url_lower
 
-        url_parts = album_href.split('/')[-1].replace('.aspx', '').split('-')
+        url_parts = album_href.split('/')[-1]
+        url_parts = url_parts.replace('.aspx', '').split('-')
         name_parts = actress_slug.split('-') if actress_slug else []
 
         matching_parts = sum(1 for part in name_parts if part in url_parts)
-        has_similar_slug = matching_parts >= len(name_parts) * 0.6
+        threshold = len(name_parts) * 0.6
+        has_similar_slug = matching_parts >= threshold
 
         return (
             (first_name and first_name in album_name_lower) or
@@ -378,19 +486,26 @@ class ActressScraper:
         )
 
 
-    async def get_ragalahari_actress_albums(self, actress_id: str) -> List[dict]:
+    async def get_ragalahari_actress_albums(
+        self, actress_id: str
+    ) -> List[dict]:
         """Get all albums for an actress"""
         cache_key = f"{actress_id}_albums"
-        if cache_key in self.cache:
-            return self.cache[cache_key]
+        cached = self._get_cache(cache_key)
+        if cached:
+            return cached
 
         detail = await self.get_ragalahari_actress_detail(actress_id)
-        if detail and cache_key in self.cache:
-            return self.cache[cache_key]
+        if detail:
+            cached = self._get_cache(cache_key)
+            if cached:
+                return cached
 
         return []
 
-    async def _extract_pagination_urls(self, soup: BeautifulSoup, base_url: str) -> List[str]:
+    async def _extract_pagination_urls(
+        self, soup: BeautifulSoup, base_url: str
+    ) -> List[str]:
         """Extract all pagination URLs from album page"""
         seen = {base_url}
         pagination_urls = [base_url]
@@ -424,66 +539,53 @@ class ActressScraper:
 
         return photos
 
-    async def _scrape_album_page(self, page_url: str, session: aiohttp.ClientSession) -> List[str]:
+    async def _scrape_album_page(self, page_url: str) -> List[str]:
         """Scrape images from a single album page"""
-        try:
-            async with session.get(page_url) as response:
-                if response.status != 200:
-                    print(f"Error fetching album page {page_url}: Status {response.status}")
-                    return []
-
-                html = await response.text()
-                return self._filter_images(html)
-
-        except (aiohttp.ClientError, TimeoutError) as e:
-            print(f"Error scraping album page {page_url}: {e}")
-            return []
+        html = await self._fetch_with_retry(page_url)
+        return self._filter_images(html) if html else []
 
     async def get_ragalahari_album_photos(self, album_url: str) -> List[str]:
         """Get all high-quality photos from an album with pagination support"""
-        session = await self._get_session()
+        html = await self._fetch_with_retry(album_url)
+        if not html:
+            return []
 
-        try:
-            async with session.get(album_url) as response:
-                if response.status != 200:
-                    print(f"Error fetching album {album_url}: Status {response.status}")
-                    return []
+        soup = BeautifulSoup(html, 'lxml')
+        pagination_urls = await self._extract_pagination_urls(
+            soup, album_url
+        )
 
-                html = await response.text()
-                soup = BeautifulSoup(html, 'html.parser')
-                pagination_urls = await self._extract_pagination_urls(soup, album_url)
-
-                if len(pagination_urls) == 1:
-                    photos = self._filter_images(html)
-                    photos.sort(
-                        key=lambda url: int(m.group(1))
-                        if (m := IMAGE_NUMBER_PATTERN.search(url)) else 0
-                    )
-                    print(f"Scraped {len(photos)} photos from album: {album_url}")
-                    return photos
-
-                print(f"Found {len(pagination_urls)} pages for album: {album_url}")
-
-            page_photos_list = await gather(
-                *[self._scrape_album_page(url, session) for url in pagination_urls]
-            )
-
-            all_photos = []
-            seen = set()
-            for page_photos in page_photos_list:
-                for photo in page_photos:
-                    if photo not in seen:
-                        all_photos.append(photo)
-                        seen.add(photo)
-
-            all_photos.sort(
+        if len(pagination_urls) == 1:
+            photos = self._filter_images(html)
+            photos.sort(
                 key=lambda url: int(m.group(1))
                 if (m := IMAGE_NUMBER_PATTERN.search(url)) else 0
             )
-            print(f"Scraped {len(all_photos)} photos across "
-                  f"{len(pagination_urls)} pages: {album_url}")
-            return all_photos
+            msg = f"Scraped {len(photos)} photos from album: {album_url}"
+            print(msg)
+            return photos
 
-        except (aiohttp.ClientError, TimeoutError) as e:
-            print(f"Error scraping album photos: {e}")
-            return []
+        page_count = len(pagination_urls)
+        print(f"Found {page_count} pages for album: {album_url}")
+
+        page_photos_list = await gather(
+            *[self._scrape_album_page(url) for url in pagination_urls]
+        )
+
+        all_photos = []
+        seen = set()
+        for page_photos in page_photos_list:
+            for photo in page_photos:
+                if photo not in seen:
+                    all_photos.append(photo)
+                    seen.add(photo)
+
+        all_photos.sort(
+            key=lambda url: int(m.group(1))
+            if (m := IMAGE_NUMBER_PATTERN.search(url)) else 0
+        )
+        photo_cnt = len(all_photos)
+        page_cnt = len(pagination_urls)
+        msg = f"Scraped {photo_cnt} photos across {page_cnt} pages: {album_url}"
+        print(msg)
+        return all_photos

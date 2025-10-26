@@ -1,6 +1,7 @@
 """FastAPI backend for Actress Gallery application"""
 
 from typing import List
+from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,11 +10,26 @@ from app.models import Actress, ActressDetail
 from app.scraper import ActressScraper
 from app.config import settings
 
-app = FastAPI(title="Actress Gallery API", version="2.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
-                   allow_methods=["*"], allow_headers=["*"])
-
 scraper = ActressScraper()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Manage application lifespan - startup and shutdown"""
+    # Startup: nothing to do, session created lazily
+    yield
+    # Shutdown: close aiohttp session
+    await scraper.close()
+
+
+app = FastAPI(title="Actress Gallery API", version="2.0.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,  # Must be False when origins is "*"
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
 
 
 @app.get("/")
@@ -40,11 +56,14 @@ async def get_actress_detail(actress_id: str):
 
 @app.get("/api/search", response_model=List[Actress])
 async def search_actresses(
-    query: str = Query(..., min_length=2),
+    query: str = Query(..., min_length=2, max_length=100),
     limit: int = Query(20, ge=1, le=100)
 ):
     """Search actresses by name"""
-    query_lower = query.lower()
+    query_lower = query.strip().lower()
+    if not query_lower:
+        return []
+
     results = []
 
     first_char = query_lower[0]
@@ -94,10 +113,22 @@ async def get_actress_albums(actress_id: str):
 
 
 @app.get("/api/album/photos", response_model=List[str])
-async def get_album_photos(album_url: str = Query(...)):
+async def get_album_photos(album_url: str = Query(..., max_length=500)):
     """Get all high-quality photos from an album"""
-    if 'ragalahari.com' not in album_url:
-        raise HTTPException(status_code=400, detail="Only Ragalahari album URLs are supported")
+    # Validate URL
+    if not album_url.startswith(('http://', 'https://')):
+        raise HTTPException(status_code=400, detail="Invalid URL format")
+
+    if 'ragalahari.com' not in album_url.lower():
+        raise HTTPException(
+            status_code=400,
+            detail="Only Ragalahari album URLs are supported"
+        )
+
+    # Prevent SSRF attacks
+    blocked_hosts = ['localhost', '127.0.0.1', '0.0.0.0', '192.168']
+    if any(blocked in album_url.lower() for blocked in blocked_hosts):
+        raise HTTPException(status_code=400, detail="Invalid URL")
 
     return await scraper.get_ragalahari_album_photos(album_url)
 
